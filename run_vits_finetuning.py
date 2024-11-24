@@ -41,12 +41,606 @@ if is_wandb_available():
     import wandb
 
 
-ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 logger = logging.getLogger(__name__)
 
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+# Add after imports and before device definition
+def setup_logging(training_args):
+    """Setup logging configuration"""
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%H:%M:%S",
+        level=logging.DEBUG,
+        handlers=[
+            logging.FileHandler("detailed_debug.log", mode='w'),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    
+    # Configure specific loggers
+    transformers_logger = logging.getLogger("transformers")
+    datasets_logger = logging.getLogger("datasets")
+    torch_logger = logging.getLogger("torch")
+    
+    # Set levels for third-party loggers
+    transformers_logger.setLevel(logging.ERROR)
+    datasets_logger.setLevel(logging.ERROR)
+    torch_logger.setLevel(logging.ERROR)
+    
+    # Ensure our main logger stays at DEBUG
+    logger.setLevel(logging.DEBUG)
+    
+    # Set format for all handlers to ensure proper string formatting
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    for handler in logger.handlers:
+        handler.setFormatter(formatter)
+    
+    # Filter warnings
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning)
+    warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Add immediately after device definition
+if device.type == "mps":
+    # Basic MPS setup
+    torch.set_default_dtype(torch.float32)
+    os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+    torch.mps.empty_cache()
+    
+    # Initialize placeholder storage
+    def initialize_mps_storage():
+        temp = torch.zeros(1, device=device)
+        del temp
+        torch.mps.empty_cache()
+    
+    initialize_mps_storage()
+
+def initialize_tensor_storage(tensor):
+    """Initialize storage for MPS tensors"""
+    if device.type == "mps":
+        # Create a temporary tensor to initialize storage
+        temp = torch.zeros(1, device=device)
+        del temp
+    return tensor.to(device)
+
+def mps_tensor_setup():
+    """Setup MPS environment with optimized settings"""
+    if device.type == "mps":
+        torch.set_default_dtype(torch.float32)
+        torch.mps.empty_cache()
+        # Optimize memory allocation
+        torch.mps.set_per_process_memory_fraction(0.8)
+        # Enable graph mode and fallback
+        os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+        # Force embedding ops to sync
+        torch._embedding_sync_force = True
+
+def pack_hook(tensor):
+    """Pack tensor for MPS storage"""
+    if device.type == "mps":
+        return tensor.detach().cpu()
+    return tensor
+
+def unpack_hook(tensor):
+    """Unpack tensor from storage to MPS"""
+    if device.type == "mps":
+        return tensor.to(device)
+    return tensor
+
+def ensure_mps_compatibility(model):
+    """Ensure model is compatible with MPS"""
+    if device.type == "mps":
+        # Force model to float32
+        model = model.float()
+        # Initialize storage
+        for param in model.parameters():
+            param.data = initialize_tensor_storage(param.data)
+        # Add embedding hooks
+        model.apply(lambda m: m.register_forward_pre_hook(mps_embedding_hook))
+    return model
+
+def prepare_batch_for_mps(batch):
+    """Helper function to prepare batch for MPS"""
+    if device.type != "mps":
+        return batch
+        
+    prepared_batch = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            prepared_batch[key] = value.to(device)
+        elif isinstance(value, dict):
+            prepared_batch[key] = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                                 for k, v in value.items()}
+        else:
+            prepared_batch[key] = value
+            
+    torch.mps.synchronize()
+    return prepared_batch
+
+def initialize_mps_embeddings(model):
+    """Specifically initialize embeddings for MPS"""
+    if device.type == "mps":
+        try:
+            # Get module directly 
+            module = model.module if hasattr(model, 'module') else model
+            embed_layer = module.text_encoder.embed_tokens
+
+            # Create new embedding weights on CPU first
+            new_weight = embed_layer.weight.data.clone().to('cpu')
+            
+            # Create new embedding on MPS
+            new_embed = torch.nn.Embedding(
+                embed_layer.num_embeddings,
+                embed_layer.embedding_dim,
+                padding_idx=embed_layer.padding_idx,
+                device='cpu'  # Initialize on CPU first
+            )
+            
+            # Copy weights while on CPU
+            new_embed.weight.data.copy_(new_weight)
+            
+            # Move to MPS
+            new_embed = new_embed.to(device)
+            
+            # Replace embedding layer
+            module.text_encoder.embed_tokens = new_embed
+            
+            # Force initialization with dummy forward pass
+            with torch.no_grad():
+                dummy_input = torch.zeros(1, dtype=torch.long, device=device)
+                _ = module.text_encoder.embed_tokens(dummy_input)
+                
+            torch.mps.synchronize()
+            
+        except Exception as e:
+            print(f"MPS embedding initialization failed: {e}")
+            raise
+    return model
+
+def mps_embedding_hook(module, input):
+    """Hook to ensure proper embedding handling on MPS"""
+    if device.type == "mps":
+        if not hasattr(module, '_mps_initialized'):
+            module._mps_initialized = True
+            if isinstance(module, torch.nn.Embedding):
+                # Ensure weight is on MPS
+                module.weight.data = module.weight.data.to(device)
+    return None
+
+def prepare_batch_for_mps(batch):
+    """Helper function to prepare batch for MPS"""
+    prepared_batch = {}
+    for key in ["input_ids", "attention_mask", "labels", "labels_attention_mask", "speaker_id"]:
+        if key in batch and batch[key] is not None:
+            if isinstance(batch[key], torch.Tensor):
+                prepared_batch[key] = batch[key].to(device)
+            else:
+                prepared_batch[key] = batch[key]
+        else:
+            prepared_batch[key] = None
+    return prepared_batch                    
+
+def ensure_tensor_on_device(tensor, device_type='mps'):
+    """Ensure tensor is properly allocated on device"""
+    if not tensor.is_cuda and device_type == 'mps':
+        tensor = tensor.to(device)
+        torch.mps.synchronize()
+    return tensor
+
+def prepare_model_inputs(batch, device_type='mps'):
+    """Ensure all inputs are properly on device"""
+    if device_type == 'mps':
+        prepared = {}
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                prepared[k] = ensure_tensor_on_device(v, device_type)
+            elif isinstance(v, dict):
+                prepared[k] = {k2: ensure_tensor_on_device(v2, device_type) 
+                             if isinstance(v2, torch.Tensor) else v2
+                             for k2, v2 in v.items()}
+            else:
+                prepared[k] = v
+        return prepared
+    return batch
+
+# Add these debug helper functions near the top
+def debug_tensor_device(tensor, name):
+    """Debug helper to print tensor device info"""
+    try:
+        info = {
+            "name": name,
+            "device": str(tensor.device),
+            "dtype": str(tensor.dtype),
+            "shape": str(tensor.shape),
+            "storage": "exists" if tensor.storage() is not None else "none"
+        }
+        debug_print(f"Tensor {name}:", 
+                   f"device={info['device']}", 
+                   f"dtype={info['dtype']}", 
+                   f"shape={info['shape']}", 
+                   f"storage={info['storage']}")
+        return tensor
+    except Exception as e:
+        debug_print(f"Error debugging tensor {name}: {e}")
+        return tensor
+
+def debug_embedding_layer(embed_layer, name):
+    """Debug helper for embedding layers"""
+    try:
+        info = {
+            "name": name,
+            "weight_device": str(embed_layer.weight.device),
+            "weight_storage": "exists" if embed_layer.weight.storage() is not None else "none",
+            "requires_grad": str(embed_layer.weight.requires_grad)
+        }
+        debug_print(f"Embedding Layer {name}:",
+                   f"weight_device={info['weight_device']}",
+                   f"weight_storage={info['weight_storage']}",
+                   f"requires_grad={info['requires_grad']}")
+        return embed_layer
+    except Exception as e:
+        debug_print(f"Error debugging embedding layer {name}: {e}")
+        return embed_layer
+
+# Modify initialize_mps_embeddings function
+def initialize_mps_embeddings(model):
+    """Specifically initialize embeddings for MPS"""
+    if device.type == "mps":
+        try:
+            print("\nDEBUG - Starting embedding initialization")
+            
+            # Get module directly 
+            module = model.module if hasattr(model, 'module') else model
+            embed_layer = module.text_encoder.embed_tokens
+            
+            debug_embedding_layer(embed_layer, "Original")
+
+            # Create new embedding weights on CPU first
+            new_weight = embed_layer.weight.data.clone().to('cpu')
+            debug_tensor_device(new_weight, "New weight (CPU)")
+            
+            # Create new embedding on CPU
+            new_embed = torch.nn.Embedding(
+                embed_layer.num_embeddings,
+                embed_layer.embedding_dim,
+                padding_idx=embed_layer.padding_idx,
+                device='cpu'
+            )
+            
+            # Copy weights while on CPU
+            with torch.no_grad():
+                new_embed.weight.copy_(new_weight)
+            
+            debug_embedding_layer(new_embed, "New embedding (CPU)")
+            
+            # Move to MPS and verify
+            new_embed = new_embed.to(device)
+            debug_embedding_layer(new_embed, "New embedding (MPS)")
+            
+            # Replace embedding layer
+            module.text_encoder.embed_tokens = new_embed
+            
+            # Force initialization with dummy forward pass
+            with torch.no_grad():
+                dummy_input = torch.zeros(1, dtype=torch.long, device=device)
+                debug_tensor_device(dummy_input, "Dummy input")
+                
+                output = module.text_encoder.embed_tokens(dummy_input)
+                debug_tensor_device(output, "Dummy output")
+                
+            torch.mps.synchronize()
+            print("DEBUG - Embedding initialization complete")
+            
+        except Exception as e:
+            print(f"MPS embedding initialization failed: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    return model
+
+# Add new debugging functions at the top
+def debug_embedding_call(weight, input, padding_idx, scale_grad_by_freq, sparse):
+    """Debug embedding function parameters"""
+    logger.debug("\nEMBEDDING OPERATION DETAILS:")
+    logger.debug(f"Weight: shape={weight.shape}, device={weight.device}, dtype={weight.dtype}")
+    logger.debug(f"Weight storage: {weight.storage()}")
+    logger.debug(f"Input: shape={input.shape}, device={input.device}, dtype={input.dtype}")
+    logger.debug(f"Input storage: {input.storage()}")
+    logger.debug(f"padding_idx: {padding_idx}")
+    logger.debug(f"scale_grad_by_freq: {scale_grad_by_freq}")
+    logger.debug(f"sparse: {sparse}")
+
+# Modify the embedding hook
+def mps_embedding_hook(module, input):
+    """Hook to ensure proper embedding handling on MPS"""
+    if device.type == "mps":
+        if isinstance(module, torch.nn.Embedding):
+            logger.debug("\nEMBEDDING HOOK TRIGGERED:")
+            logger.debug(f"Module weight device: {module.weight.device}")
+            logger.debug(f"Module weight storage: {module.weight.storage()}")
+            logger.debug(f"Input device: {input[0].device}")
+            logger.debug(f"Input storage: {input[0].storage()}")
+            
+            # Force weight to MPS and verify storage
+            module.weight.data = module.weight.data.to(device)
+            torch.mps.synchronize()
+            
+            logger.debug("After moving to MPS:")
+            logger.debug(f"Module weight device: {module.weight.device}")
+            logger.debug(f"Module weight storage: {module.weight.storage()}")
+    return None
+
+# Add near the top after imports
+def debug_embedding_inputs(weight, input, padding_idx=None, scale_grad_by_freq=False, sparse=False):
+    """Debug helper for embedding function inputs"""
+    logger.debug("\n=== EMBEDDING FUNCTION CALL ===")
+    logger.debug(f"Weight tensor: shape={weight.shape}, device={weight.device}, dtype={weight.dtype}")
+    logger.debug(f"Weight storage exists: {weight.storage() is not None}")
+    logger.debug(f"Input tensor: shape={input.shape}, device={input.device}, dtype={input.dtype}")
+    logger.debug(f"Input storage exists: {input.storage() is not None}")
+    logger.debug(f"padding_idx: {padding_idx}")
+    logger.debug(f"scale_grad_by_freq: {scale_grad_by_freq}")
+    logger.debug(f"sparse: {sparse}")
+    logger.debug("==============================\n")
+
+# Monkey patch torch.nn.functional.embedding to add debugging
+original_embedding = torch.nn.functional.embedding
+
+def debug_embedding(*args, **kwargs):
+    """Debug wrapper for embedding function that safely handles all arguments"""
+    try:
+        debug_print("=== EMBEDDING FUNCTION CALL ===")
+        
+        # Safely extract and format arguments
+        input_tensor = args[0] if args else kwargs.get('input')
+        weight_tensor = args[1] if len(args) > 1 else kwargs.get('weight')
+        
+        # Safely get tensor info
+        input_info = {
+            "shape": input_tensor.shape if input_tensor is not None else None,
+            "device": input_tensor.device if input_tensor is not None else None,
+            "dtype": input_tensor.dtype if input_tensor is not None else None
+        }
+        
+        weight_info = {
+            "shape": weight_tensor.shape if weight_tensor is not None else None,
+            "device": weight_tensor.device if weight_tensor is not None else None,
+            "dtype": weight_tensor.dtype if weight_tensor is not None else None
+        }
+        
+        # Print debug info
+        debug_print(
+            "Input:", input_info,
+            "\nWeight:", weight_info,
+            "\nOther args:", {
+                "padding_idx": args[2] if len(args) > 2 else kwargs.get('padding_idx', None),
+                "max_norm": args[3] if len(args) > 3 else kwargs.get('max_norm', None),
+                "norm_type": args[4] if len(args) > 4 else kwargs.get('norm_type', 2.0),
+                "scale_grad_by_freq": args[5] if len(args) > 5 else kwargs.get('scale_grad_by_freq', False),
+                "sparse": args[6] if len(args) > 6 else kwargs.get('sparse', False)
+            }
+        )
+
+        # Call original embedding
+        result = original_embedding(*args, **kwargs)
+        debug_print("Embedding call successful")
+        return result
+        
+    except Exception as e:
+        debug_print(f"!!! Embedding call failed !!! Error: {str(e)}")
+        raise
+
+torch.nn.functional.embedding = debug_embedding
+
+# Add near top after imports
+def debug_print(*args, **kwargs):
+    """Helper to force-print debug messages"""
+    try:
+        message = " ".join(str(arg) for arg in args)
+        print(f"[DEBUG] {message}", flush=True)
+        if logger:
+            logger.debug(message)
+    except Exception as e:
+        print(f"[DEBUG ERROR] Failed to print debug message: {e}", flush=True)
+
+# Add this new function near the other MPS helper functions
+def ensure_model_on_device(model, device):
+    """Ensure all model parameters and buffers are on the correct device"""
+    try:
+        # Move all parameters to device
+        for param in model.parameters():
+            if param.device != device:
+                param.data = param.data.to(device)
+                
+        # Move all buffers to device
+        for buffer in model.buffers():
+            if buffer.device != device:
+                buffer.data = buffer.data.to(device)
+                
+        # Special handling for embeddings
+        if hasattr(model, 'text_encoder') and hasattr(model.text_encoder, 'embed_tokens'):
+            model.text_encoder.embed_tokens = model.text_encoder.embed_tokens.to(device)
+            model.text_encoder.embed_tokens.weight.data = model.text_encoder.embed_tokens.weight.data.to(device)
+            
+        torch.mps.synchronize()
+        return model
+        
+    except Exception as e:
+        debug_print(f"Error ensuring model on device: {str(e)}")
+        raise
+
+# Add after the other helper functions
+
+def reshape_for_stft(waveform):
+    """Reshape waveform tensor for STFT processing"""
+    if len(waveform.shape) == 3:
+        # [batch, channels, time] -> [batch * channels, time]
+        return waveform.reshape(-1, waveform.shape[-1])
+    return waveform
+
+def restore_shape(features, original_shape):
+    """Restore original batch and channel dimensions"""
+    if len(original_shape) == 3:
+        # [batch * channels, ...] -> [batch, channels, ...]
+        return features.reshape(original_shape[0], original_shape[1], *features.shape[1:])
+    return features
+
+def process_mel_spectrograms(waveform, feature_extractor):
+    """Process waveform to mel spectrograms with proper reshaping"""
+    original_shape = waveform.shape
+    reshaped_waveform = reshape_for_stft(waveform)
+    
+    # Extract features
+    features = feature_extractor._torch_extract_fbank_features(reshaped_waveform)
+    
+    # Restore original dimensions if needed
+    if isinstance(features, tuple):
+        return tuple(restore_shape(f, original_shape) for f in features)
+    return restore_shape(features, original_shape)
+
+# Add this helper function after the other helper functions
+def ensure_3d_tensor(tensor):
+    """Ensures tensor is in (batch_size, channels, time) format"""
+    if len(tensor.shape) == 4:
+        # If [batch, channels, height, width], collapse last two dimensions
+        return tensor.reshape(tensor.shape[0], tensor.shape[1], -1)
+    elif len(tensor.shape) == 2:
+        # If [batch, time], add channel dimension
+        return tensor.unsqueeze(1)
+    return tensor
+
+# Modify the process_mel_spectrograms function
+def process_mel_spectrograms(waveform, feature_extractor):
+    """Process waveform to mel spectrograms with proper reshaping"""
+    original_shape = waveform.shape
+    reshaped_waveform = reshape_for_stft(waveform)
+    
+    # Extract features
+    features = feature_extractor._torch_extract_fbank_features(reshaped_waveform)
+    
+    # Restore original dimensions and ensure 3D format
+    if isinstance(features, tuple):
+        return tuple(ensure_3d_tensor(restore_shape(f, original_shape)) for f in features)
+    return ensure_3d_tensor(restore_shape(features, original_shape))
+
+# Add this helper function after the other helper functions 
+def prepare_discriminator_input(waveform):
+    """
+    Prepare waveform tensor for discriminator by ensuring correct shape
+    Expects input shape: [batch_size, channels, time]
+    Returns: [batch_size, 1, time]
+    """
+    if len(waveform.shape) == 3:
+        # If [batch_size, channels, time], collapse channels into time
+        batch_size, channels, time = waveform.shape
+        if channels > 1:
+            # Average across channels if multi-channel
+            waveform = waveform.mean(dim=1, keepdim=True)
+    elif len(waveform.shape) == 2:
+        # If [batch_size, time], add channel dimension
+        waveform = waveform.unsqueeze(1)
+    elif len(waveform.shape) == 1:
+        # If [time], add batch and channel dimensions
+        waveform = waveform.unsqueeze(0).unsqueeze(0)
+    
+    return waveform
+
+# Add new helper function after the other helper functions
+def ensure_matching_device_dtype(tensor, reference_tensor=None):
+    """
+    Ensure tensor matches device and dtype of reference tensor or defaults to MPS float32
+    """
+    if reference_tensor is not None:
+        target_device = reference_tensor.device
+        target_dtype = reference_tensor.dtype
+    else:
+        target_device = device
+        target_dtype = torch.float32
+        
+    if tensor.device != target_device or tensor.dtype != target_dtype:
+        tensor = tensor.to(device=target_device, dtype=target_dtype)
+        if device.type == "mps":
+            torch.mps.synchronize()
+    return tensor
+
+# Modify prepare_discriminator_input function
+def prepare_discriminator_input(waveform, discriminator=None):
+    """
+    Prepare waveform tensor for discriminator by ensuring correct shape and type
+    """
+    # First ensure correct shape
+    if len(waveform.shape) == 3:
+        batch_size, channels, time = waveform.shape
+        if channels > 1:
+            waveform = waveform.mean(dim=1, keepdim=True)
+    elif len(waveform.shape) == 2:
+        waveform = waveform.unsqueeze(1)
+    elif len(waveform.shape) == 1:
+        waveform = waveform.unsqueeze(0).unsqueeze(0)
+    
+    # Get reference tensor from discriminator if available
+    if discriminator is not None and hasattr(discriminator, 'discriminators') and len(discriminator.discriminators) > 0:
+        reference_tensor = next(discriminator.parameters())
+    else:
+        reference_tensor = None
+        
+    # Ensure matching device and dtype
+    waveform = ensure_matching_device_dtype(waveform, reference_tensor)
+    
+    return waveform
+
+# Add this helper function after the other helper functions
+def ensure_matching_sizes(tensor_a, tensor_b, target_size=None):
+    """
+    Ensure two tensors have matching sizes by interpolating if necessary
+    Args:
+        tensor_a: First tensor [B, C, T] 
+        tensor_b: Second tensor [B, C, T]
+        target_size: Optional target size for channels
+    Returns:
+        Tuple of tensors with matching sizes
+    """
+    # Log shapes before processing
+    if logger:
+        logger.debug(f"Before resizing - A shape: {tensor_a.shape}, B shape: {tensor_b.shape}")
+        
+    # Early return if sizes already match
+    if tensor_a.shape[1] == tensor_b.shape[1]:
+        return tensor_a, tensor_b
+
+    # If target_size not specified, use the smaller dimension
+    if target_size is None:
+        target_size = min(tensor_a.shape[1], tensor_b.shape[1])
+
+    def interpolate_tensor(tensor, target):
+        """Helper to interpolate a single tensor to target channel size"""
+        if tensor.shape[1] != target:
+            tensor = tensor.transpose(1, 2)  # [B, C, T] -> [B, T, C]
+            tensor = torch.nn.functional.interpolate(
+                tensor.unsqueeze(1),  # [B, 1, T, C]
+                size=(tensor.shape[1], target),  # Keep time dim, change channels
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(1)  # Back to [B, T, C]
+            tensor = tensor.transpose(1, 2)  # [B, C, T]
+        return tensor
+
+    # Resize tensors
+    tensor_a = interpolate_tensor(tensor_a, target_size)
+    tensor_b = interpolate_tensor(tensor_b, target_size)
+
+    # Log shapes after processing
+    if logger:
+        logger.debug(f"After resizing - A shape: {tensor_a.shape}, B shape: {tensor_b.shape}")
+        
+    # Verify shapes match
+    assert tensor_a.shape[1] == tensor_b.shape[1], f"Channel dimensions should match but got {tensor_a.shape[1]} != {tensor_b.shape[1]}"
+
+    return tensor_a, tensor_b
 
 #### ARGUMENTS
-
 
 @dataclass
 class ModelArguments:
@@ -335,7 +929,6 @@ class DataCollatorTTSWithPadding:
         batched_speech = BatchFeature({"input_features": raw_speech})
 
         # convert into correct format for padding
-
         padded_inputs = self.feature_extractor.pad(
             batched_speech,
             padding=True,
@@ -346,40 +939,56 @@ class DataCollatorTTSWithPadding:
         return padded_inputs
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        # split inputs and labels since they have to be of different lengths and need
-        # different padding methods
+        batch = {}
+        
+        # Handle input_ids
         model_input_name = "input_ids"
-        input_ids = [{model_input_name: feature[model_input_name]} for feature in features]
+        input_ids = [{model_input_name: feature[model_input_name]} for feature in features if model_input_name in feature]
+        if input_ids:
+            batch = self.tokenizer.pad(input_ids, return_tensors="pt", return_attention_mask=self.forward_attention_mask)
 
-        # pad input tokens
-        batch = self.tokenizer.pad(input_ids, return_tensors="pt", return_attention_mask=self.forward_attention_mask)
+        # Handle waveform
+        if any("waveform" in feature for feature in features):
+            waveforms = [np.array(feature["waveform"]) for feature in features if "waveform" in feature]
+            batch["waveform"] = self.pad_waveform(waveforms)
 
-        # pad waveform
-        waveforms = [np.array(feature["waveform"]) for feature in features]
-        batch["waveform"] = self.pad_waveform(waveforms)
+        # Handle labels
+        if all("labels" in feature for feature in features):
+            label_features = [np.array(feature["labels"]) for feature in features]
+            labels_batch = self.feature_extractor.pad(
+                {"input_features": [i.T for i in label_features]}, 
+                return_tensors="pt", 
+                return_attention_mask=True
+            )
+            batch["labels"] = labels_batch["input_features"].transpose(1, 2)
+            batch["labels_attention_mask"] = labels_batch["attention_mask"]
 
-        # pad spectrogram
-        label_features = [np.array(feature["labels"]) for feature in features]
-        labels_batch = self.feature_extractor.pad(
-            {"input_features": [i.T for i in label_features]}, return_tensors="pt", return_attention_mask=True
-        )
+        # Handle mel spectrograms
+        if all("mel_scaled_input_features" in feature for feature in features):
+            mel_scaled_input_features = {
+                "input_features": [np.array(feature["mel_scaled_input_features"]).squeeze().T for feature in features]
+            }
+            mel_scaled_features = self.feature_extractor.pad(
+                mel_scaled_input_features, 
+                return_tensors="pt", 
+                return_attention_mask=True
+            )["input_features"].transpose(1, 2)
+            batch["mel_scaled_input_features"] = mel_scaled_features
 
-        labels = labels_batch["input_features"].transpose(1, 2)
-        batch["labels"] = labels
-        batch["labels_attention_mask"] = labels_batch["attention_mask"]
+        # Handle speaker_id
+        if all("speaker_id" in feature for feature in features):
+            batch["speaker_id"] = torch.tensor([feature["speaker_id"] for feature in features])
+        else:
+            batch["speaker_id"] = None
 
-        # pad mel spectrogram
-        mel_scaled_input_features = {
-            "input_features": [np.array(feature["mel_scaled_input_features"]).squeeze().T for feature in features]
-        }
-        mel_scaled_input_features = self.feature_extractor.pad(
-            mel_scaled_input_features, return_tensors="pt", return_attention_mask=True
-        )["input_features"].transpose(1, 2)
-
-        batch["mel_scaled_input_features"] = mel_scaled_input_features
-        batch["speaker_id"] = (
-            torch.tensor([feature["speaker_id"] for feature in features]) if "speaker_id" in features[0] else None
-        )
+        # Move everything to device at once at the end
+        if device.type == "mps":
+            torch.mps.synchronize()
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                    for k, v in batch.items()}
+        else:
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v 
+                    for k, v in batch.items()}
 
         return batch
 
@@ -429,10 +1038,15 @@ def kl_loss(prior_latents, posterior_log_variance, prior_means, prior_log_varian
     """
 
     kl = prior_log_variance - posterior_log_variance - 0.5
+    kl = kl.to(device)
+    prior_latents = prior_latents.to(device)
+    prior_means = prior_means.to(device)
+    prior_log_variance = prior_log_variance.to(device)
+    labels_mask = labels_mask.to(device)
+    
     kl += 0.5 * ((prior_latents - prior_means) ** 2) * torch.exp(-2.0 * prior_log_variance)
     kl = torch.sum(kl * labels_mask)
-    loss = kl / torch.sum(labels_mask)
-    return loss
+    return kl / torch.sum(labels_mask)
 
 
 # LOGGING AND EVALUATION METHODS
@@ -501,6 +1115,9 @@ def compute_val_metrics_and_losses(
     batch_size,
     compute_clap_similarity=False,
 ):
+    mel_scaled_target, mel_scaled_generation = ensure_matching_sizes(
+        mel_scaled_target, mel_scaled_generation
+    )
     loss_mel = torch.nn.functional.l1_loss(mel_scaled_target, mel_scaled_generation)
     loss_kl = kl_loss(
         model_outputs.prior_latents,
@@ -540,26 +1157,7 @@ def main():
     send_example_telemetry("run_vits_finetuning", model_args, data_args)
 
     # 2. Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-    log_level = training_args.get_process_log_level()
-    logger.setLevel(log_level)
-    datasets.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.enable_default_handler()
-    transformers.utils.logging.enable_explicit_format()
-
-    logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
-
-    # Log on each process the small summary:
-    logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        f"distributed training: {training_args.parallel_mode.value == 'distributed'}, 16-bits training: {training_args.fp16}"
-    )
-    logger.info(f"Training/evaluation parameters {training_args}")
+    setup_logging(training_args)
 
     # Set the verbosity to info of the Transformers logger (on main process only):
     if is_main_process(training_args.local_rank):
@@ -722,8 +1320,16 @@ def main():
                 new_num_speakers = len(speaker_id_dict)
 
     def prepare_dataset(batch):
-        # process target audio
+        # Ensure the device is defined globally or passed in
+        device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+        # Process target audio
         sample = batch[audio_column_name]
+        
+        # Add MPS synchronization for audio processing
+        if device.type == "mps":
+            torch.mps.synchronize()
+       
         audio_inputs = feature_extractor(
             sample["array"],
             sampling_rate=sample["sampling_rate"],
@@ -731,26 +1337,46 @@ def main():
             do_normalize=do_normalize,
         )
 
-        batch["labels"] = audio_inputs.get("input_features")[0]
+        # Move tensors to device with initialization
+        batch["labels"] = initialize_tensor_storage(
+            torch.tensor(audio_inputs.get("input_features")[0], dtype=torch.float32)
+        )
 
-        # process text inputs
+        # Process text inputs
         input_str = batch[text_column_name].lower() if do_lower_case else batch[text_column_name]
-        
         if is_uroman:
             input_str = uromanize(input_str, uroman_path=uroman_path)
+
+        # Tokenize and move to device
         string_inputs = tokenizer(input_str, return_attention_mask=False)
+        batch[model_input_name] = torch.tensor(
+            string_inputs.get("input_ids")[: max_tokens_length + 1], dtype=torch.long
+        ).to(device)
 
-        batch[model_input_name] = string_inputs.get("input_ids")[: max_tokens_length + 1]
+        # Compute waveform input length
         batch["waveform_input_length"] = len(sample["array"])
+
+        # Tokens input length
         batch["tokens_input_length"] = len(batch[model_input_name])
-        batch["waveform"] = batch[audio_column_name]["array"]
 
-        batch["mel_scaled_input_features"] = audio_inputs.get("mel_scaled_input_features")[0]
+        # Convert waveform to tensor and move to device
+        batch["waveform"] = torch.tensor(batch[audio_column_name]["array"], dtype=torch.float32).to(device)
 
-        if speaker_id_column_name is not None:
-            if new_num_speakers > 1:
-                # align speaker_id to [0, num_speaker_id-1].
-                batch["speaker_id"] = speaker_id_dict.get(batch[speaker_id_column_name], 0)
+        # Process mel-scaled input features and move to device
+        batch["mel_scaled_input_features"] = torch.tensor(
+            audio_inputs.get("mel_scaled_input_features")[0], dtype=torch.float32
+        ).to(device)
+
+        # Handle speaker ID
+        if speaker_id_column_name is not None and new_num_speakers > 1:
+            # Align speaker_id to [0, num_speakers-1]
+            batch["speaker_id"] = torch.tensor(
+                speaker_id_dict.get(batch[speaker_id_column_name], 0), dtype=torch.long
+            ).to(device)
+     
+    #    print("Input IDs device:", batch["input_ids"].device)
+    #    print("Attention mask device:", batch["attention_mask"].device)
+    #    print("Labels device:", batch["labels"].device)
         return batch
 
     remove_columns = next(iter(raw_datasets.values())).column_names
@@ -797,6 +1423,10 @@ def main():
         logger.info(f"Data preprocessing finished. Files cached at {cache}.")
         return
 
+    # In main(), after loading config and before loading the model
+    if device.type == "mps":
+        mps_tensor_setup()
+
     # 8. Load pretrained model,
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
@@ -807,8 +1437,48 @@ def main():
         revision=model_args.model_revision,
         token=model_args.token,
         trust_remote_code=model_args.trust_remote_code,
-    )
+    ).to('cpu')  # Initialize on CPU first
 
+    if device.type == "mps":
+        debug_print("Moving model to MPS...")
+        # Initialize embeddings first
+        model = initialize_mps_embeddings(model)
+        
+        # Move everything to device and verify
+        model = model.to(device)
+        model = ensure_model_on_device(model, device)  # Changed from ensure_module_on_device
+        
+        # Verify initialization
+        with torch.no_grad():
+            try:
+                dummy_batch = {
+                    "input_ids": torch.zeros(1, 1, dtype=torch.long, device=device),
+                    "attention_mask": torch.ones(1, 1, dtype=torch.long, device=device)
+                }
+                debug_print("Running model verification...")
+                _ = model(**dummy_batch)
+                torch.mps.synchronize()
+                debug_print("Model verification successful")
+            except Exception as e:
+                debug_print(f"Model verification failed: {e}")
+                raise
+
+    # Initialize storage for MPS
+    if device.type == "mps":
+        # Initialize embedding weights
+        model.text_encoder.embed_tokens.weight.data = initialize_tensor_storage(
+            model.text_encoder.embed_tokens.weight.data
+        )
+        
+        # Initialize all model parameters
+        for param in model.parameters():
+            param.data = initialize_tensor_storage(param.data)
+
+    model = model.to(device)
+    
+    # Add after model initialization
+    if device.type == "mps":
+        model.apply(lambda m: m.register_forward_pre_hook(mps_embedding_hook))
     
     with training_args.main_process_first(desc="apply_weight_norm"):
         # apply weight norms
@@ -868,9 +1538,12 @@ def main():
     # inspired from https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image.py
     # and https://github.com/huggingface/community-events/blob/main/huggan/pytorch/cyclegan/train.py
 
+    # Move these sections in the correct order
+    # 1. First the logging directory setup
     logging_dir = os.path.join(training_args.output_dir, training_args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=training_args.output_dir, logging_dir=logging_dir)
-
+    
+    # 2. Create accelerator
     accelerator = Accelerator(
         gradient_accumulation_steps=training_args.gradient_accumulation_steps,
         log_with=training_args.report_to,
@@ -878,6 +1551,47 @@ def main():
         kwargs_handlers=[ddp_kwargs],
     )
 
+    # 3. Initialize discriminator - modify this section
+    discriminator = VitsDiscriminator(config).to(device)
+    
+    # Initialize discriminator weights
+    for disc in discriminator.discriminators:
+        disc.apply_weight_norm()
+
+    # Ensure both model and discriminator are on correct device
+    if device.type == "mps":
+        debug_print("Verifying model device after accelerator preparation...")
+        model = ensure_model_on_device(model, device)
+        discriminator = ensure_model_on_device(discriminator, device)
+        debug_print("Model device verification complete")
+
+    # Skip this problematic section since discriminator is already initialized
+    """
+    # hack to be able to train on multiple device  
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        model.discriminator.save_pretrained(tmpdirname)
+        discriminator = VitsDiscriminator.from_pretrained(tmpdirname).to(device)
+        for disc in discriminator.discriminators:
+            disc.apply_weight_norm()
+    del model.discriminator
+    """
+
+    # Continue with optimizer initialization
+    gen_optimizer = torch.optim.AdamW(
+        model.parameters(),
+        training_args.learning_rate,
+        betas=[training_args.adam_beta1, training_args.adam_beta2],
+        eps=training_args.adam_epsilon,
+    )
+
+    # 4. Now verify devices after discriminator is created
+    if device.type == "mps":
+        debug_print("Verifying model device after accelerator preparation...")
+        model = ensure_model_on_device(model, device)
+        discriminator = ensure_model_on_device(discriminator, device)
+        debug_print("Model device verification complete")
+
+    # Continue with the rest of the setup
     per_device_train_batch_size = (
         training_args.per_device_train_batch_size if training_args.per_device_train_batch_size else 1
     )
@@ -953,7 +1667,7 @@ def main():
     # hack to be able to train on multiple device
     with tempfile.TemporaryDirectory() as tmpdirname:
         model.discriminator.save_pretrained(tmpdirname)
-        discriminator = VitsDiscriminator.from_pretrained(tmpdirname)
+        discriminator = VitsDiscriminator.from_pretrained(tmpdirname).to(device)
         for disc in discriminator.discriminators:
             disc.apply_weight_norm()
     del model.discriminator
@@ -1005,6 +1719,14 @@ def main():
             num_training_steps=num_training_steps,
         )
 
+    # Add before training loop
+    if device.type == "mps":
+        with torch.no_grad():
+            # Pre-initialize embeddings
+            dummy_ids = torch.arange(0, tokenizer.vocab_size, dtype=torch.long, device=device)
+            _ = model.text_encoder.embed_tokens(dummy_ids)
+            torch.mps.empty_cache()
+    
     # Prepare everything with our `accelerator`.
     (
         model,
@@ -1042,7 +1764,18 @@ def main():
     logger.info(f"  Total optimization steps = {training_args.max_steps}")
     global_step = 0
     first_epoch = 0
-
+    
+    # Add near the start of training
+    if device.type == "mps":
+        # Optimize memory allocation
+        torch.mps.empty_cache()
+        # Optimize for batch size 16
+        torch.mps.set_per_process_memory_fraction(0.8)  # Increased for your batch size
+        # Enable graph mode for better performance
+        os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+        # Force embedding ops to sync
+        torch._embedding_sync_force = True
+    
     # Potentially load in the weights and states from a previous save
     if training_args.resume_from_checkpoint:
         if training_args.resume_from_checkpoint != "latest":
@@ -1080,6 +1813,12 @@ def main():
     )
 
     for epoch in range(first_epoch, training_args.num_train_epochs):
+        # Add device checking in training loop
+        if device.type == "mps":
+            # Sync device periodically
+            torch.mps.synchronize()
+            torch.mps.empty_cache()
+
         # keep track of train losses
         train_losses = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
@@ -1088,9 +1827,13 @@ def main():
             gen_lr_scheduler.step()
 
         for step, batch in enumerate(train_dataloader):
-            # print(f"batch {step}, process{accelerator.process_index}, waveform {(batch['waveform'].shape)}, tokens {(batch['input_ids'].shape)}... ")
+            if device.type == "mps":
+                torch.mps.synchronize()
+                batch = prepare_batch_for_mps(batch)
+                model = ensure_model_on_device(model, device)  # Changed from ensure_module_on_device
+                
             with accelerator.accumulate(model, discriminator):
-                # forward through model
+                # First get model outputs
                 model_outputs = model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
@@ -1101,23 +1844,50 @@ def main():
                     monotonic_alignment_function=maximum_path,
                 )
 
-                mel_scaled_labels = batch["mel_scaled_input_features"]
-                mel_scaled_target = slice_segments(mel_scaled_labels, model_outputs.ids_slice, model_segment_size)
-                mel_scaled_generation = feature_extractor._torch_extract_fbank_features(
-                    model_outputs.waveform.squeeze(1)
-                )[1]
+                # Generate mel spectrograms from labels instead of waveform
+                with torch.no_grad():
+                    # Use labels as the target audio
+                    target_mel = ensure_3d_tensor(
+                        process_mel_spectrograms(
+                            batch["labels"].transpose(1, 2),
+                            feature_extractor
+                        )[1]
+                    )
+                    
+                    generated_mel = ensure_3d_tensor(
+                        process_mel_spectrograms(
+                            model_outputs.waveform.squeeze(1),
+                            feature_extractor
+                        )[1]
+                    )
 
-                target_waveform = batch["waveform"].transpose(1, 2)
+                # Slice segments using the generated features
+                mel_scaled_target = slice_segments(target_mel, model_outputs.ids_slice, model_segment_size)
+                mel_scaled_generation = generated_mel
+
+                # Use labels for target waveform instead of batch["waveform"]
+                target_waveform = batch["labels"].transpose(1, 2)
                 target_waveform = slice_segments(
-                    target_waveform, model_outputs.ids_slice * feature_extractor.hop_length, config_segment_size
+                    target_waveform, 
+                    model_outputs.ids_slice * feature_extractor.hop_length, 
+                    config_segment_size
                 )
 
                 # -----------------------
                 #  Train Discriminator
                 # -----------------------
 
-                discriminator_target, _ = discriminator(target_waveform)
-                discriminator_candidate, _ = discriminator(model_outputs.waveform.detach())
+                # Prepare inputs for discriminator
+                target_waveform_disc = prepare_discriminator_input(target_waveform, discriminator)
+                generated_waveform_disc = prepare_discriminator_input(model_outputs.waveform.detach(), discriminator)
+
+                if device.type == "mps":
+                    # Ensure discriminator is on correct device with correct dtype
+                    discriminator = ensure_model_on_device(discriminator, device)
+                    torch.mps.synchronize()
+
+                discriminator_target, _ = discriminator(target_waveform_disc)
+                discriminator_candidate, _ = discriminator(generated_waveform_disc)
 
                 loss_disc, loss_real_disc, loss_fake_disc = discriminator_loss(
                     discriminator_target, discriminator_candidate
@@ -1136,10 +1906,17 @@ def main():
                 #  Train Generator
                 # -----------------------
 
-                _, fmaps_target = discriminator(target_waveform)
-                discriminator_candidate, fmaps_candidate = discriminator(model_outputs.waveform)
+                # Prepare inputs for discriminator
+                target_waveform_disc = prepare_discriminator_input(target_waveform, discriminator)
+                generated_waveform_disc = prepare_discriminator_input(model_outputs.waveform, discriminator)
+
+                _, fmaps_target = discriminator(target_waveform_disc)
+                discriminator_candidate, fmaps_candidate = discriminator(generated_waveform_disc)
 
                 loss_duration = torch.sum(model_outputs.log_duration)
+                mel_scaled_target, mel_scaled_generation = ensure_matching_sizes(
+                    mel_scaled_target, mel_scaled_generation
+                )
                 loss_mel = torch.nn.functional.l1_loss(mel_scaled_target, mel_scaled_generation)
                 loss_kl = kl_loss(
                     model_outputs.prior_latents,
@@ -1160,7 +1937,12 @@ def main():
                 )
 
                 # backpropagate
-                accelerator.backward(total_generator_loss)
+                # Ensure gradients are properly handled
+                if device.type == "mps":
+                    with torch.autograd.graph.saved_tensors_hooks(pack_hook, unpack_hook):
+                        accelerator.backward(total_generator_loss)
+                else:
+                    accelerator.backward(total_generator_loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), training_args.max_grad_norm)
                 gen_optimizer.step()
@@ -1189,6 +1971,10 @@ def main():
                     l + losses[i].item() / training_args.gradient_accumulation_steps
                     for (i, l) in enumerate(train_losses)
                 ]
+                
+                # After backward pass
+                if device.type == "mps":
+                    torch.mps.synchronize()
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -1290,14 +2076,28 @@ def main():
                             monotonic_alignment_function=maximum_path,
                         )
 
-                        mel_scaled_labels = batch["mel_scaled_input_features"]
-                        mel_scaled_target = slice_segments(
-                            mel_scaled_labels, model_outputs_train.ids_slice, model_segment_size
+                        # Generate mel spectrograms
+                        target_mel = ensure_3d_tensor(
+                            process_mel_spectrograms(
+                                batch["labels"].transpose(1, 2),
+                                feature_extractor
+                            )[1]
                         )
-                        mel_scaled_generation = feature_extractor._torch_extract_fbank_features(
-                            model_outputs_train.waveform.squeeze(1)
-                        )[1]
+                        
+                        generated_mel = ensure_3d_tensor(
+                            process_mel_spectrograms(
+                                model_outputs_train.waveform.squeeze(1),
+                                feature_extractor
+                            )[1]
+                        )
 
+                        # Slice segments
+                        mel_scaled_target = slice_segments(target_mel, model_outputs_train.ids_slice, model_segment_size)
+                        mel_scaled_generation = generated_mel
+
+                        mel_scaled_target, mel_scaled_generation = ensure_matching_sizes(
+                            mel_scaled_target, mel_scaled_generation
+                        )
                         val_losses = compute_val_metrics_and_losses(
                             val_losses,
                             accelerator,
@@ -1309,7 +2109,10 @@ def main():
                         )
 
                     print(f"VALIDATION - batch {step}, process{accelerator.process_index}, PADDING AND GATHER... ")
-                    specs = feature_extractor._torch_extract_fbank_features(model_outputs_train.waveform.squeeze(1))[0]
+                    specs = process_mel_spectrograms(
+                        model_outputs_train.waveform.squeeze(1),
+                        feature_extractor
+                    )[0]
                     padded_attn, specs, target_specs = accelerator.pad_across_processes(
                         [model_outputs_train.attn.squeeze(1), specs, batch["labels"]], dim=1
                     )
@@ -1324,7 +2127,7 @@ def main():
                     if accelerator.is_main_process:
                         with torch.no_grad():
                             speaker_id = None if num_speakers < 2 else list(range(min(5, num_speakers)))
-                            full_generation = model(**full_generation_sample.to(model.device), speaker_id=speaker_id)
+                            full_generation = model(**full_generation_sample.to(device), speaker_id=speaker_id)
 
                         generated_audio.append(generated_train_waveform.cpu())
                         generated_attn.append(padded_attn.cpu())
@@ -1333,15 +2136,15 @@ def main():
 
                 logger.info("Validation inference done, now evaluating... ")
                 if accelerator.is_main_process:
-                    generated_audio = [audio.numpy() for audio_batch in generated_audio for audio in audio_batch]
+                    generated_audio = [audio.cpu().numpy() for audio_batch in generated_audio for audio in audio_batch]
                     generated_attn = [
-                        plot_alignment_to_numpy(attn.numpy()) for attn_batch in generated_attn for attn in attn_batch
+                        plot_alignment_to_numpy(attn.cpu().numpy()) for attn_batch in generated_attn for attn in attn_batch
                     ]
                     generated_spec = [
-                        plot_spectrogram_to_numpy(attn.numpy()) for attn_batch in generated_spec for attn in attn_batch
+                        plot_spectrogram_to_numpy(attn.cpu().numpy()) for attn_batch in generated_spec for attn in attn_batch
                     ]
                     target_spec = [
-                        plot_spectrogram_to_numpy(attn.numpy()) for attn_batch in target_spec for attn in attn_batch
+                        plot_spectrogram_to_numpy(attn.cpu().numpy()) for attn_batch in target_spec for attn in attn_batch
                     ]
                     full_generation_waveform = full_generation.waveform.cpu().numpy()
 
@@ -1392,14 +2195,28 @@ def main():
                         monotonic_alignment_function=maximum_path,
                     )
 
-                    mel_scaled_labels = batch["mel_scaled_input_features"]
-                    mel_scaled_target = slice_segments(
-                        mel_scaled_labels, model_outputs_train.ids_slice, model_segment_size
+                    # Generate mel spectrograms
+                    target_mel = ensure_3d_tensor(
+                        process_mel_spectrograms(
+                            batch["labels"].transpose(1, 2),
+                            feature_extractor
+                        )[1]
                     )
-                    mel_scaled_generation = feature_extractor._torch_extract_fbank_features(
-                        model_outputs_train.waveform.squeeze(1)
-                    )[1]
+                    
+                    generated_mel = ensure_3d_tensor(
+                        process_mel_spectrograms(
+                            model_outputs_train.waveform.squeeze(1),
+                            feature_extractor
+                        )[1]
+                    )
 
+                    # Slice segments
+                    mel_scaled_target = slice_segments(target_mel, model_outputs_train.ids_slice, model_segment_size)
+                    mel_scaled_generation = generated_mel
+
+                    mel_scaled_target, mel_scaled_generation = ensure_matching_sizes(
+                        mel_scaled_target, mel_scaled_generation
+                    )
                     val_losses = compute_val_metrics_and_losses(
                         val_losses,
                         accelerator,
@@ -1409,7 +2226,10 @@ def main():
                         per_device_train_batch_size,
                         compute_clap_similarity=False,
                     )
-                specs = feature_extractor._torch_extract_fbank_features(model_outputs_train.waveform.squeeze(1))[0]
+                specs = process_mel_spectrograms(
+                    model_outputs_train.waveform.squeeze(1),
+                    feature_extractor
+                )[0]
                 padded_attn, specs, target_specs = accelerator.pad_across_processes(
                     [model_outputs_train.attn.squeeze(1), specs, batch["labels"]], dim=1
                 )
@@ -1424,7 +2244,7 @@ def main():
                 if accelerator.is_main_process:
                     with torch.no_grad():
                         speaker_id = None if num_speakers < 2 else list(range(min(5, num_speakers)))
-                        full_generation = model(**full_generation_sample.to(model.device), speaker_id=speaker_id)
+                        full_generation = model(**full_generation_sample.to(device), speaker_id=speaker_id)
 
                     generated_audio.append(generated_train_waveform.cpu())
                     generated_attn.append(padded_attn.cpu())
